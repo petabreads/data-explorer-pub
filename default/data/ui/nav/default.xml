@@ -1,0 +1,7 @@
+<nav search_view="search" color="#0099CD">
+  <collection label="Data Explorer">
+    <view name="de_baseline_overview" label="Baseline Overview" default="true" />
+  </collection>
+  <view name="search" />
+  <view name="dashboards" />
+</nav>
