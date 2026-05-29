@@ -1,0 +1,12 @@
+[]
+access = read : [ * ], write : [ admin, power ]
+export = system
+
+[savedsearches]
+access = read : [ * ], write : [ admin, power ]
+
+[macros]
+access = read : [ * ], write : [ admin, power ]
+
+[lookups]
+access = read : [ * ], write : [ admin, power ]
