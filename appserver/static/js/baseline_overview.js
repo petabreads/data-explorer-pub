@@ -279,10 +279,8 @@ var HTML_SKELETON = `
           <label>Alert Type</label>
           <div class="toggle-group" id="alerts-type">
             <button class="toggle active" data-atype="all">All</button>
-            <button class="toggle"        data-atype="low">Low ↓</button>
-            <button class="toggle"        data-atype="high">High ↑</button>
             <button class="toggle"        data-atype="silent">Silent</button>
-            <button class="toggle"        data-atype="unknown">Unknown</button>
+            <button class="toggle"        data-atype="absent">Absent</button>
           </div>
         </div>
         <div class="filter-group">
@@ -453,24 +451,29 @@ function buildFleetSpl(win, critFilter) {
         ? '| where criticality="' + esc(critFilter) + '" '
         : '';
     return ''
-        + '| tstats count as current_events WHERE `de_monitored_index` '
-        +     'earliest=' + win + ' latest=now BY host, sourcetype, index '
-        + '| eval _key=host."::".sourcetype '
-        + '| lookup data_source_registry_lookup _key OUTPUT criticality, host_role, system_boundary, status '
+        + '| tstats count as ev WHERE `de_monitored_index` '
+        +     'earliest=' + win + ' latest=now BY host, sourcetype, index, _time span=1h '
+        + '| lookup de_host_registry_lookup host OUTPUT criticality, host_role, system_boundary, status '
         + critClause
-        + '| eval slot_key=host."::".sourcetype."::".strftime(relative_time(now(),"-1h@h"),"%w").'
-        + '"::".tonumber(strftime(relative_time(now(),"-1h@h"),"%H")) '
+        + '| eval slot_key=host."::".sourcetype."::".strftime(_time,"%w")."::".tonumber(strftime(_time,"%H")) '
         + '| join type=left slot_key ['
         +     'search `de_summary_index` sourcetype="de:hourly_stat" earliest=-28d latest=now '
         +     '| eval slot_key=s_host."::".s_sourcetype."::".dow."::".hod '
         +     '| stats median(events) as med, stdev(events) as sd BY slot_key'
         + '] '
-        + '| eval z=if(isnotnull(sd) AND sd>0, round((current_events-med)/sd, 2), 0), abs_z=abs(z) '
+        // collapse hourly buckets -> per host::sourcetype; expected = sum of slot medians,
+        // combined stdev = sqrt(sum of slot variances) — correct for any multi-hour window
+        + '| eval sd2=if(isnotnull(sd), pow(sd,2), null()) '
+        + '| stats sum(ev) as events, sum(med) as med, sum(sd2) as var_sum, '
+        +         'values(criticality) as criticality, values(host_role) as host_role, '
+        +         'values(system_boundary) as boundary BY host, sourcetype '
+        + '| eval sd_combined=sqrt(var_sum) '
+        + '| eval z=if(isnotnull(sd_combined) AND sd_combined>0, round((events-med)/sd_combined, 2), 0), abs_z=abs(z) '
         + '| sort 0 host -abs_z '
         + '| stats first(z) as worst_z, first(sourcetype) as worst_st, first(abs_z) as worst_abs_z, '
-        +         'sum(current_events) as events, dc(sourcetype) as st_count, '
+        +         'sum(events) as events, dc(sourcetype) as st_count, '
         +         'values(criticality) as crit_mv, values(host_role) as host_role, '
-        +         'values(system_boundary) as boundary BY host '
+        +         'values(boundary) as boundary BY host '
         + '| eval criticality=mvindex(crit_mv, 0) '
         + '| eval severity=case(worst_abs_z>=' + Z_CRIT + ', "crit", worst_abs_z>=' + Z_WARN + ', "warn", true(), "ok") '
         + '| sort 0 -worst_abs_z host';
@@ -481,9 +484,12 @@ function buildSilentSpl(critFilter) {
         ? '| where criticality="' + esc(critFilter) + '" '
         : '';
     return ''
-        + '| inputlookup data_source_registry_lookup '
+        + '| inputlookup de_host_registry_lookup '
         + '| where status="active" '
         + critClause
+        + '| join type=left host ['
+        +     '| inputlookup data_source_registry_lookup | stats max(last_seen) as last_seen BY host'
+        + '] '
         + '| stats values(criticality) as criticality, values(host_role) as host_role, '
         +         'values(system_boundary) as boundary, max(last_seen) as last_seen BY host';
 }
@@ -638,7 +644,7 @@ function loadHostPickerIfNeeded() {
     if (hostPickerLoaded) return;
     hostPickerLoaded = true;
     var spl = ''
-        + '| inputlookup data_source_registry_lookup '
+        + '| inputlookup de_host_registry_lookup '
         + '| where status="active" '
         + '| stats count BY host '
         + '| sort host';
@@ -675,28 +681,33 @@ function loadHost() {
     if (!host) return;
 
     var identitySpl = ''
-        + '| inputlookup data_source_registry_lookup '
+        + '| inputlookup de_host_registry_lookup '
         + '| where host="' + esc(host) + '" '
         + '| stats values(host_role) as host_role, values(system_boundary) as boundary, '
-        +         'values(criticality) as criticality, values(status) as status, '
-        +         'count as st_count, max(last_seen) as last_seen BY host';
+        +         'values(criticality) as criticality, values(status) as status BY host '
+        + '| join type=left host ['
+        +     '| inputlookup data_source_registry_lookup | where host="' + esc(host) + '" '
+        +     '| stats count as st_count, max(last_seen) as last_seen BY host'
+        + '] ';
 
     runSearch(identitySpl, '-1d', 'now', function(rows) {
         renderHostIdentity(rows[0] || { host: host });
     });
 
     var stSpl = ''
-        + '| tstats count as current_events WHERE `de_monitored_index` host="' + esc(host) + '" '
-        +     'earliest=' + win + ' latest=now BY sourcetype, index '
-        + '| eval slot_key=sourcetype."::".strftime(relative_time(now(),"-1h@h"),"%w").'
-        +     '"::".tonumber(strftime(relative_time(now(),"-1h@h"),"%H")) '
+        + '| tstats count as ev WHERE `de_monitored_index` host="' + esc(host) + '" '
+        +     'earliest=' + win + ' latest=now BY sourcetype, index, _time span=1h '
+        + '| eval slot_key=sourcetype."::".strftime(_time,"%w")."::".tonumber(strftime(_time,"%H")) '
         + '| join type=left slot_key ['
         +     'search `de_summary_index` sourcetype="de:hourly_stat" s_host="' + esc(host) + '" '
         +     'earliest=-28d latest=now '
         +     '| eval slot_key=s_sourcetype."::".dow."::".hod '
         +     '| stats median(events) as med, stdev(events) as sd BY slot_key'
         + '] '
-        + '| eval z=if(isnotnull(sd) AND sd>0, round((current_events-med)/sd, 2), 0) '
+        + '| eval sd2=if(isnotnull(sd), pow(sd,2), null()) '
+        + '| stats sum(ev) as current_events, sum(med) as med, sum(sd2) as var_sum BY sourcetype '
+        + '| eval sd_combined=sqrt(var_sum) '
+        + '| eval z=if(isnotnull(sd_combined) AND sd_combined>0, round((current_events-med)/sd_combined, 2), 0) '
         + '| eval pct=if(med>0, round((current_events-med)/med*100, 1), null()) '
         + '| eval severity=case(abs(z)>=' + Z_CRIT + ', "crit", abs(z)>=' + Z_WARN + ', "warn", true(), "ok") '
         + '| sort 0 -current_events';
@@ -814,7 +825,7 @@ function buildAlertsSpl(range) {
         +         'values(alert_event_type) as event_types, '
         +         'last(severity) as severity, last(message) as message, '
         +         'last(affected_host) as host, last(affected_sourcetype) as sourcetype, '
-        +         'last(alert_type) as alert_type, last(z_score) as z_score, '
+        +         'last(alert_type) as alert_type, '
         +         'last(system_boundary) as system_boundary '
         +         'BY alert_id '
         + '| eval status=if(match(mvjoin(event_types, ","), "close"), "closed", "open") '
@@ -845,10 +856,8 @@ function loadAlerts() {
             if (STATE.alerts.severity !== 'all' && r.severity !== STATE.alerts.severity) return false;
             var at = STATE.alerts.alertType;
             if (at !== 'all') {
-                if (at === 'silent'  && r.alert_type !== 'source_silent')  return false;
-                if (at === 'unknown' && r.alert_type !== 'unknown_source') return false;
-                if (at === 'low'  && !(r.alert_type === 'volume_anomaly' && Number(r.z_score) < 0)) return false;
-                if (at === 'high' && !(r.alert_type === 'volume_anomaly' && Number(r.z_score) > 0)) return false;
+                if (at === 'silent' && r.alert_type !== 'source_silent') return false;
+                if (at === 'absent' && r.alert_type !== 'source_absent') return false;
             }
             return true;
         });
@@ -997,7 +1006,7 @@ function renderAlertTimeline(rows, range) {
     }
     function rowY(i) { return i * (ROW_H + GAP); }
 
-    var typeColor = { source_silent: '#555f6c', unknown_source: '#009cde', volume_anomaly: '#dc4e41' };
+    var typeColor = { source_silent: '#555f6c', source_absent: '#009cde' };
     var svg = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + totalW + '" height="' + H + '" style="display:block">'];
 
     stOrder.forEach(function(st, i) {
@@ -1096,13 +1105,7 @@ function renderAlertTable(rows) {
 
     function typeHtml(r) {
         if (r.alert_type === 'source_silent')  return '<span class="al-type-silent">Silent</span>';
-        if (r.alert_type === 'unknown_source') return '<span class="al-type-unknown">Unknown</span>';
-        if (r.alert_type === 'volume_anomaly') {
-            var z = Number(r.z_score);
-            return z < 0
-                ? '<span class="al-type-volume-low">Low ↓ (' + escHtml(r.z_score) + ')</span>'
-                : '<span class="al-type-volume-high">High ↑ (+' + escHtml(r.z_score) + ')</span>';
-        }
+        if (r.alert_type === 'source_absent')  return '<span class="al-type-unknown">Absent</span>';
         return escHtml(r.alert_type || '—');
     }
 
