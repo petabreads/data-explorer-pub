@@ -1,0 +1,11 @@
+host_role,channel,category,expected_frequency
+dc,xmlwineventlog:security,endpoint_windows,900
+dc,wineventlog:security,endpoint_windows,900
+dc,xmlwineventlog:system,endpoint_windows,900
+dc,wineventlog:system,endpoint_windows,900
+dc,xmlwineventlog:application,endpoint_windows,3600
+dc,wineventlog:application,endpoint_windows,3600
+dc,xmlwineventlog:microsoft-windows-sysmon/operational,endpoint_windows,900
+dc,wineventlog:microsoft-windows-sysmon/operational,endpoint_windows,900
+dc,xmlwineventlog:microsoft-windows-powershell/operational,endpoint_windows,900
+dc,wineventlog:microsoft-windows-powershell/operational,endpoint_windows,900
